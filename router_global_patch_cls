@@ -1,0 +1,2003 @@
+# router_global_concat_patch_alpha_sweep_clf.py
+# Baseline C:
+#   - Router (KMeans) on GLOBAL embeddings (DINOv2 global)
+#   - Classifier (choose: LR / LightGBM) on CONCAT features: [Xg || alpha*Xp]
+#     where Xp is pooled patch tokens (DINOv2 patch tokens)
+#
+# Adds:
+#   - Sweep K_TYPES via K_MIN..K_MAX (inclusive) with step K_STEP
+#   - Save confusion matrix + per-class metrics for final classifier
+#   - Save router-step evaluation:
+#       * class-vs-type contingency matrix
+#       * type purity / dominant class
+#       * router majority-vote confusion matrix and per-class metrics
+#   - Choose best parameter setting by final Acc(argmax)
+#
+# Keeps:
+#   - global good-gate tau sweep (single tau) with FPR<=5% constraint
+#
+# Outputs per (K, alpha):
+#   OUT_ROOT/k_<K>/alpha_<a>/
+#       type_assignments.csv
+#
+#       # Router step evaluation
+#       router_eval/
+#           train/
+#               router_class_vs_type_matrix.(csv/txt)
+#               router_type_metrics.(csv/txt)
+#               router_type_to_class_mapping_train.csv
+#               router_majority_vote_train/
+#                   confusion_matrix.(csv/txt)
+#                   per_class_metrics.(csv/txt)
+#           test/
+#               router_class_vs_type_matrix.(csv/txt)
+#               router_type_metrics.(csv/txt)
+#               router_type_to_class_mapping_test.csv
+#               router_majority_vote_test/
+#                   confusion_matrix.(csv/txt)
+#                   per_class_metrics.(csv/txt)
+#
+#       # Final classifier evaluation
+#       confusion_matrix.(csv/txt)                 (argmax)
+#       per_class_metrics.(csv/txt)                (argmax)
+#       test_predictions.csv                       (argmax)
+#       tau_sweep.csv                              (global tau sweep)
+#       best_tau_<tau>/
+#           confusion_matrix.(csv/txt)             (global tau gating)
+#           per_class_metrics.(csv/txt)            (global tau gating)
+#       test_predictions_best_tau.csv              (global tau gating)
+#       summary.csv
+#
+# Sweep summary:
+#   OUT_ROOT/k_alpha_sweep_summary.csv
+#
+# Best config:
+#   OUT_ROOT/best_config_by_accuracy.csv
+
+import os
+import csv
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List, Any
+
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    confusion_matrix,
+    accuracy_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+
+# Optional LightGBM (only needed if CLASSIFIER_BACKEND="lgbm")
+try:
+    import lightgbm as lgb
+    _HAS_LGB = True
+except Exception:
+    _HAS_LGB = False
+
+
+# =========================
+# Config
+# =========================
+DATA_ROOT = Path("Data")
+GLOBAL_EMB_DIR = Path("embeddings_dinov2")
+PATCH_ROOT = Path("/home/xluan3/simi_challenge/patch_tokens_dinov2")
+
+OUT_ROOT = Path("baseline4_alpha_sweep")
+
+CLASS_NAMES = ["good", "defect1", "defect2", "defect3", "defect4", "defect5", "defect8", "defect9", "defect10"]
+name2id = {n: i for i, n in enumerate(CLASS_NAMES)}
+
+SEED = 0
+TEST_SIZE = 0.30
+
+USE_HIERARCHICAL_CLASSIFICATION = False
+
+# Which router uncertainty/confidence score to use for exclusion:
+#   "softmax_conf" : smaller = harder
+#   "margin"       : smaller = harder
+#   "entropy"      : larger  = harder
+# Use one of:
+#   "threshold" -> exclude samples with softmax_conf < ROUTER_SOFTMAX_CONF_THRESHOLD
+#                  use this: ROUTER_SOFTMAX_CONF_THRESHOLD = 0.099
+#   "top_n"     -> exclude the lowest-confidence TOP_N samples
+MANUAL_REVIEW_MODE = "top_n"
+ROUTER_HARD_TOP_N = 150
+ROUTER_CONFIDENCE_SCORE = "softmax_conf"
+ROUTER_CONFIDENCE_THRESHOLD = 0.099
+
+# -------------------------
+# Router: sweep K
+# -------------------------
+K_MIN = 10
+K_MAX = 30
+K_STEP = 1
+
+# If True, clamp K to <= #GOOD_train to avoid crashing; if False, raise an error.
+CLAMP_K_TO_GOOD_TRAIN = True
+
+# Classifier selection
+#   "lr"   -> LogisticRegression
+#   "lgbm" -> LightGBM LGBMClassifier
+CLASSIFIER_BACKEND = "lr"
+
+# LR hyperparams
+C_VALUES: List[float] = [30, 40, 50, 60,]
+USE_BALANCED = True   # applied to GLOBAL fallback only
+
+# Patch pooling
+PATCH_POOL = "mean"   # "mean" | "max" | "meanmax" | "topkmean" | "topkmeanmax"
+PATCH_TOPK = 32
+
+# If you know exact key in npz, set it. Else None for auto-detect.
+PATCH_NPZ_KEY: Optional[str] = None
+
+# Alpha sweep
+ALPHA_MIN = 1.0
+ALPHA_MAX = 1.6
+ALPHA_STEP = 0.1
+ALPHAS: List[float] = [round(float(a), 10) for a in np.arange(ALPHA_MIN, ALPHA_MAX + 1e-12, ALPHA_STEP)]
+
+# Only train type-specific classifier if enough samples in that type
+MIN_SAMPLES_PER_TYPE = 100
+
+# Threshold tuning constraints
+FPR_MAX_GLOBAL_TAU = 0.05
+
+# Tau grid
+TAUS = np.linspace(0.05, 0.995, 191)
+
+# -------------------------
+# Manual-review exclusion based on router confidence
+# -------------------------
+ENABLE_MANUAL_REVIEW_EXCLUSION = True
+
+# =========================
+# Utils
+# =========================
+def l2norm(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    return X / (np.linalg.norm(X, axis=1, keepdims=True) + eps)
+
+def float_to_str(x: float) -> str:
+    s = f"{x:.10f}".rstrip("0").rstrip(".")
+    return s if s != "" else "0"
+
+def alpha_to_str(alpha: float) -> str:
+    """
+    Stable folder/file-safe string for alpha.
+    Examples:
+      0.0  -> 0
+      0.3  -> 0.3
+      1.5  -> 1.5
+      2.0  -> 2
+    """
+    s = f"{alpha:.10f}".rstrip("0").rstrip(".")
+    return s if s != "" else "0"
+
+def compute_router_confidence_scores(X: np.ndarray, km: KMeans) -> Dict[str, np.ndarray]:
+    """
+    Compute router confidence scores from distances to KMeans centers.
+
+    Returns:
+      assigned_type      : argmin distance
+      d_min             : distance to nearest center
+      d_second          : distance to second nearest center
+      margin            : d_second - d_min
+      norm_margin       : (d_second - d_min) / (d_second + 1e-12)
+      softmax_conf      : max soft assignment probability based on exp(-distance)
+      entropy           : entropy of soft assignment (higher = more ambiguous)
+      top2_ratio        : d_min / (d_second + 1e-12)   smaller = more confident
+    """
+    # distances: (N, K)
+    D = km.transform(X)
+
+    # order distances
+    order = np.argsort(D, axis=1)
+    assigned_type = order[:, 0]
+
+    row_idx = np.arange(D.shape[0])
+    d_min = D[row_idx, order[:, 0]]
+    d_second = D[row_idx, order[:, 1]] if D.shape[1] >= 2 else d_min.copy()
+
+    margin = d_second - d_min
+    norm_margin = margin / (d_second + 1e-12)
+    top2_ratio = d_min / (d_second + 1e-12)
+
+    # pseudo-probabilities from distances
+    # subtract row min for numerical stability
+    logits = -D
+    logits = logits - logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    probs = exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-12)
+
+    softmax_conf = probs.max(axis=1)
+    entropy = -np.sum(probs * np.log(probs + 1e-12), axis=1)
+
+    return {
+        "assigned_type": assigned_type.astype(int),
+        "d_min": d_min.astype(float),
+        "d_second": d_second.astype(float),
+        "margin": margin.astype(float),
+        "norm_margin": norm_margin.astype(float),
+        "softmax_conf": softmax_conf.astype(float),
+        "entropy": entropy.astype(float),
+        "top2_ratio": top2_ratio.astype(float),
+        "all_distances": D.astype(float),
+        "soft_probs": probs.astype(float),
+    }
+
+def save_router_confidence_csv(
+    out_path: Path,
+    meta_rows,
+    split_name: str,
+    y_true: np.ndarray,
+    conf: Dict[str, np.ndarray],
+    class_names: List[str],
+):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    K = conf["all_distances"].shape[1]
+
+    header = [
+        "split",
+        "source",
+        "filename",
+        "filepath",
+        "global_idx",
+        "true_class",
+        "assigned_type",
+        "d_min",
+        "d_second",
+        "margin",
+        "norm_margin",
+        "top2_ratio",
+        "softmax_conf",
+        "entropy",
+    ]
+    header += [f"dist_type_{k}" for k in range(K)]
+    header += [f"prob_type_{k}" for k in range(K)]
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+
+        for i, row in enumerate(meta_rows):
+            out = [
+                split_name,
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                class_names[int(y_true[i])],
+                int(conf["assigned_type"][i]),
+                float(conf["d_min"][i]),
+                float(conf["d_second"][i]),
+                float(conf["margin"][i]),
+                float(conf["norm_margin"][i]),
+                float(conf["top2_ratio"][i]),
+                float(conf["softmax_conf"][i]),
+                float(conf["entropy"][i]),
+            ]
+            out += list(map(float, conf["all_distances"][i]))
+            out += list(map(float, conf["soft_probs"][i]))
+            w.writerow(out)
+
+def save_router_hard_samples_csv(
+    out_path: Path,
+    meta_rows,
+    split_name: str,
+    y_true: np.ndarray,
+    conf: Dict[str, np.ndarray],
+    class_names: List[str],
+    top_n: int = 200,
+    sort_by: str = "softmax_conf",
+):
+    """
+    Export the hardest router decisions.
+
+    sort_by:
+      - "softmax_conf" ascending -> lower confidence is harder
+      - "margin" ascending       -> smaller nearest-second gap is harder
+      - "entropy" descending     -> higher entropy is harder
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    N = len(y_true)
+    idx = np.arange(N)
+
+    if sort_by == "softmax_conf":
+        idx = idx[np.argsort(conf["softmax_conf"])]          # low conf first
+    elif sort_by == "margin":
+        idx = idx[np.argsort(conf["margin"])]                # small gap first
+    elif sort_by == "entropy":
+        idx = idx[np.argsort(-conf["entropy"])]              # high entropy first
+    else:
+        raise ValueError("sort_by must be one of: softmax_conf, margin, entropy")
+
+    idx = idx[:min(top_n, len(idx))]
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "rank",
+            "split",
+            "source",
+            "filename",
+            "filepath",
+            "global_idx",
+            "true_class",
+            "assigned_type",
+            "d_min",
+            "d_second",
+            "margin",
+            "norm_margin",
+            "top2_ratio",
+            "softmax_conf",
+            "entropy",
+        ])
+
+        for rank, i in enumerate(idx, start=1):
+            row = meta_rows[i]
+            w.writerow([
+                rank,
+                split_name,
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                class_names[int(y_true[i])],
+                int(conf["assigned_type"][i]),
+                float(conf["d_min"][i]),
+                float(conf["d_second"][i]),
+                float(conf["margin"][i]),
+                float(conf["norm_margin"][i]),
+                float(conf["top2_ratio"][i]),
+                float(conf["softmax_conf"][i]),
+                float(conf["entropy"][i]),
+            ])
+
+def get_manual_review_mask_from_router_conf(
+    conf: Dict[str, np.ndarray],
+    mode: str = "threshold",
+    score_name: str = "softmax_conf",
+    threshold: float = 0.35,
+    top_n: int = 200,
+) -> np.ndarray:
+    """
+    Returns boolean mask of samples to be sent to manual review.
+    True = exclude from automatic pipeline.
+
+    score_name:
+      - "softmax_conf": smaller = harder
+      - "margin":       smaller = harder
+      - "entropy":      larger  = harder
+    """
+    if score_name not in {"softmax_conf", "margin", "entropy"}:
+        raise ValueError("score_name must be one of: softmax_conf, margin, entropy")
+
+    score = np.asarray(conf[score_name], dtype=float)
+    n = len(score)
+
+    if mode == "threshold":
+        if score_name in {"softmax_conf", "margin"}:
+            # low score = hard
+            return score < threshold
+        else:
+            # entropy high = hard
+            return score > threshold
+
+    if mode == "top_n":
+        mask = np.zeros(n, dtype=bool)
+
+        if score_name in {"softmax_conf", "margin"}:
+            # smallest values are hardest
+            idx = np.argsort(score)
+        else:
+            # largest entropy values are hardest
+            idx = np.argsort(-score)
+
+        mask[idx[:min(top_n, n)]] = True
+        return mask
+
+    raise ValueError("mode must be 'threshold' or 'top_n'")
+
+def save_manual_review_samples_csv(
+    out_path: Path,
+    meta_rows,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    type_id: np.ndarray,
+    conf: Dict[str, np.ndarray],
+    class_names: List[str],
+    manual_review_mask: np.ndarray,
+    split_name: str = "test",
+):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "split",
+            "source",
+            "filename",
+            "filepath",
+            "global_idx",
+            "true_class",
+            "pred_class",
+            "type_id",
+            "softmax_conf",
+            "entropy",
+            "manual_review"
+        ])
+
+        for i, row in enumerate(meta_rows):
+            if not manual_review_mask[i]:
+                continue
+            w.writerow([
+                split_name,
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                class_names[int(y_true[i])],
+                class_names[int(y_pred[i])],
+                int(type_id[i]),
+                float(conf["softmax_conf"][i]),
+                float(conf["entropy"][i]),
+                1,
+            ])
+def evaluate_with_exclusion(
+    y_true_mult: np.ndarray,
+    y_pred_mult: np.ndarray,
+    proba: np.ndarray,
+    exclude_mask: np.ndarray,
+    class_names: List[str],
+):
+    """
+    Evaluate classifier after excluding manual-review samples.
+    """
+    keep_mask = ~exclude_mask
+
+    y_true_keep = y_true_mult[keep_mask]
+    y_pred_keep = y_pred_mult[keep_mask]
+    proba_keep = proba[keep_mask]
+
+    if len(y_true_keep) == 0:
+        raise ValueError("All samples were excluded; no samples left for evaluation.")
+
+    y_true_bin_keep = (y_true_keep != 0).astype(int)
+    defect_score_keep = 1.0 - proba_keep[:, 0]
+
+    auroc_keep = float(roc_auc_score(y_true_bin_keep, defect_score_keep))
+    ap_keep = float(average_precision_score(y_true_bin_keep, defect_score_keep))
+    acc_keep = float(accuracy_score(y_true_keep, y_pred_keep))
+    cm_keep = confusion_matrix(
+        y_true_keep,
+        y_pred_keep,
+        labels=list(range(len(class_names)))
+    )
+
+    return {
+        "n_total": int(len(y_true_mult)),
+        "n_excluded": int(np.sum(exclude_mask)),
+        "n_kept": int(np.sum(keep_mask)),
+        "exclude_rate": float(np.mean(exclude_mask)),
+        "AUROC_excluded": auroc_keep,
+        "AP_excluded": ap_keep,
+        "Acc_excluded": acc_keep,
+        "cm_excluded": cm_keep,
+        "y_true_keep": y_true_keep,
+        "y_pred_keep": y_pred_keep,
+        "keep_mask": keep_mask,
+    }
+
+def save_exclusion_summary(out_path: Path, stats: Dict[str, Any]):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        for k, v in stats.items():
+            if k in {"cm_excluded", "y_true_keep", "y_pred_keep", "keep_mask"}:
+                continue
+            w.writerow([k, v])
+            
+def pool_patch_tokens(tokens_2d_or_3d: np.ndarray, method: str = "mean", topk: int = 64) -> np.ndarray:
+    """
+    tokens_2d_or_3d: (P,D) or (N,P,D)
+    returns:
+      - if input is (P,D): (D') vector
+      - if input is (N,P,D): (N,D') matrix
+    """
+    if tokens_2d_or_3d.ndim == 2:
+        T = tokens_2d_or_3d[None, ...]
+        one = True
+    elif tokens_2d_or_3d.ndim == 3:
+        T = tokens_2d_or_3d
+        one = False
+    else:
+        raise ValueError(f"Expected (P,D) or (N,P,D), got {tokens_2d_or_3d.shape}")
+
+    N, P, D = T.shape
+
+    if method == "mean":
+        out = T.mean(axis=1)
+    elif method == "max":
+        out = T.max(axis=1)
+    elif method == "meanmax":
+        out = np.concatenate([T.mean(axis=1), T.max(axis=1)], axis=1)
+    else:
+        norms = np.linalg.norm(T, axis=2)  # (N,P)
+        k = min(topk, P)
+        idx = np.argpartition(norms, -k, axis=1)[:, -k:]
+        rows = np.arange(N)[:, None]
+        topk_tokens = T[rows, idx, :]
+        topk_mean = topk_tokens.mean(axis=1)
+
+        if method == "topkmean":
+            out = topk_mean
+        elif method == "topkmeanmax":
+            out = np.concatenate([topk_mean, T.max(axis=1)], axis=1)
+        else:
+            raise ValueError(f"Unknown PATCH_POOL={method}")
+
+    return out[0] if one else out
+
+
+def load_npz_one(npz_path: Path, forced_key: Optional[str] = None) -> np.ndarray:
+    """
+    Return patch tokens as (P,D).
+    """
+    if not npz_path.exists():
+        raise FileNotFoundError(f"Missing patch npz: {npz_path}")
+
+    data = np.load(npz_path, allow_pickle=True)
+    keys = list(data.keys())
+    if len(keys) == 0:
+        raise ValueError(f"Empty npz: {npz_path}")
+
+    if forced_key is not None:
+        if forced_key not in data:
+            raise KeyError(f"Key '{forced_key}' not in {npz_path}, keys={keys}")
+        arr = data[forced_key]
+    else:
+        preferred = ["patch_tokens", "tokens", "patch", "x", "arr_0", "features"]
+        key_use = None
+        for k in preferred:
+            if k in data:
+                key_use = k
+                break
+        if key_use is None:
+            best_k, best_size = None, -1
+            for k in keys:
+                a = np.array(data[k])
+                size = int(np.prod(a.shape))
+                if size > best_size:
+                    best_size, best_k = size, k
+            key_use = best_k
+        arr = data[key_use]
+
+    arr = np.array(arr)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected (P,D) in {npz_path}, got {arr.shape}")
+    return arr
+
+
+def export_types_csv(path: Path, meta, split, type_id):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["split", "source", "filename", "filepath", "global_idx", "type_id"])
+        for row, sp, t in zip(meta, split, type_id):
+            w.writerow([sp, row["source"], row["filename"], row["filepath"], row["global_idx"], int(t)])
+
+
+def save_confusion_matrix(out_dir: Path, cm: np.ndarray):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_dir / "confusion_matrix.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["true\\pred"] + CLASS_NAMES)
+        for i, row in enumerate(cm):
+            w.writerow([CLASS_NAMES[i]] + list(map(int, row)))
+
+    txt_path = out_dir / "confusion_matrix.txt"
+    with open(txt_path, "w") as f:
+        f.write("Class order:\n")
+        f.write(", ".join(CLASS_NAMES) + "\n\n")
+        f.write(np.array2string(cm, separator=", "))
+
+
+def compute_per_class_metrics(cm: np.ndarray, class_names: List[str]) -> List[Dict[str, float]]:
+    """
+    For multiclass setting:
+      recall_i = TP_i / (# true class i)
+      class_accuracy here is defined the same way:
+        correct predictions among true samples of class i
+    """
+    results = []
+    total = int(cm.sum())
+
+    for i, cls in enumerate(class_names):
+        tp = int(cm[i, i])
+        fn = int(cm[i, :].sum() - tp)
+        fp = int(cm[:, i].sum() - tp)
+        tn = int(total - tp - fn - fp)
+        support = int(cm[i, :].sum())
+
+        recall = tp / support if support > 0 else 0.0
+        class_accuracy = recall
+
+        results.append({
+            "class_name": cls,
+            "support": support,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+            "recall": float(recall),
+            "class_accuracy": float(class_accuracy),
+        })
+
+    return results
+
+
+def save_per_class_metrics(out_dir: Path, metrics: List[Dict[str, float]]):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_dir / "per_class_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["class_name", "support", "tp", "fp", "fn", "tn", "recall", "class_accuracy"])
+        for row in metrics:
+            w.writerow([
+                row["class_name"],
+                row["support"],
+                row["tp"],
+                row["fp"],
+                row["fn"],
+                row["tn"],
+                f"{row['recall']:.6f}",
+                f"{row['class_accuracy']:.6f}",
+            ])
+
+    txt_path = out_dir / "per_class_metrics.txt"
+    with open(txt_path, "w") as f:
+        f.write("Per-class metrics\n")
+        f.write("=" * 60 + "\n")
+        for row in metrics:
+            f.write(
+                f"{row['class_name']:10s}  "
+                f"support={row['support']:4d}  "
+                f"recall={row['recall']:.4f}  "
+                f"class_accuracy={row['class_accuracy']:.4f}\n"
+            )
+
+def compute_type_real_pred_table(
+    type_id: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_names: List[str],
+    k_types: int,
+) -> List[Dict[str, Any]]:
+    """
+    For each router type, summarize:
+      - total size
+      - real class counts
+      - predicted class counts
+      - correct class counts
+    """
+    rows = []
+    C = len(class_names)
+
+    for t in range(k_types):
+        idx = np.where(type_id == t)[0]
+        row: Dict[str, Any] = {
+            "type_id": int(t),
+            "size": int(len(idx)),
+        }
+
+        if len(idx) == 0:
+            for cls in class_names:
+                row[f"real_{cls}"] = 0
+                row[f"pred_{cls}"] = 0
+                row[f"correct_{cls}"] = 0
+            row["n_correct_total"] = 0
+            row["acc_within_type"] = 0.0
+            rows.append(row)
+            continue
+
+        yt = y_true[idx]
+        yp = y_pred[idx]
+
+        n_correct_total = 0
+        for c, cls in enumerate(class_names):
+            real_count = int(np.sum(yt == c))
+            pred_count = int(np.sum(yp == c))
+            correct_count = int(np.sum((yt == c) & (yp == c)))
+
+            row[f"real_{cls}"] = real_count
+            row[f"pred_{cls}"] = pred_count
+            row[f"correct_{cls}"] = correct_count
+
+            n_correct_total += correct_count
+
+        row["n_correct_total"] = int(n_correct_total)
+        row["acc_within_type"] = float(n_correct_total / len(idx))
+        rows.append(row)
+
+    return rows
+
+def save_type_real_pred_table(
+    out_path: Path,
+    rows: List[Dict[str, Any]],
+    class_names: List[str],
+):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = ["type_id", "size"]
+    fieldnames += [f"real_{cls}" for cls in class_names]
+    fieldnames += [f"pred_{cls}" for cls in class_names]
+    fieldnames += [f"correct_{cls}" for cls in class_names]
+    fieldnames += ["n_correct_total", "acc_within_type"]
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            row_to_write = row.copy()
+            row_to_write["acc_within_type"] = f"{row['acc_within_type']:.6f}"
+            w.writerow(row_to_write)  
+
+def save_typewise_confusion_matrices(
+    out_dir: Path,
+    type_id: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_names: List[str],
+    k_types: int,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for t in range(k_types):
+        idx = np.where(type_id == t)[0]
+        if len(idx) == 0:
+            continue
+
+        cm = confusion_matrix(
+            y_true[idx],
+            y_pred[idx],
+            labels=list(range(len(class_names)))
+        )
+        save_confusion_matrix(out_dir / f"type_{t}", cm) 
+# =========================
+# Router-step evaluation
+# =========================
+def save_router_class_type_matrix(
+    out_dir: Path,
+    y_true: np.ndarray,
+    type_id: np.ndarray,
+    class_names: List[str],
+    k_types: int
+) -> np.ndarray:
+    """
+    Save contingency table:
+      rows = true image class
+      cols = router type_id
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mat = np.zeros((len(class_names), k_types), dtype=int)
+    for y, t in zip(y_true, type_id):
+        mat[int(y), int(t)] += 1
+
+    csv_path = out_dir / "router_class_vs_type_matrix.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["class\\type"] + [f"type_{k}" for k in range(k_types)])
+        for i, row in enumerate(mat):
+            w.writerow([class_names[i]] + list(map(int, row)))
+
+    txt_path = out_dir / "router_class_vs_type_matrix.txt"
+    with open(txt_path, "w") as f:
+        f.write("Rows=true class, Cols=router type\n")
+        f.write("Class order:\n")
+        f.write(", ".join(class_names) + "\n\n")
+        f.write(np.array2string(mat, separator=", "))
+
+    return mat
+
+
+def compute_router_type_metrics(mat: np.ndarray, class_names: List[str]) -> List[Dict[str, Any]]:
+    """
+    For each router type (cluster), compute:
+      - size
+      - dominant class
+      - purity
+      - class distribution
+    mat shape = (num_classes, num_types)
+    """
+    num_classes, num_types = mat.shape
+    results = []
+
+    for t in range(num_types):
+        col = mat[:, t]
+        size = int(col.sum())
+
+        if size == 0:
+            dominant_class = "EMPTY"
+            dominant_count = 0
+            purity = 0.0
+        else:
+            dom_idx = int(np.argmax(col))
+            dominant_class = class_names[dom_idx]
+            dominant_count = int(col[dom_idx])
+            purity = dominant_count / size
+
+        row = {
+            "type_id": t,
+            "size": size,
+            "dominant_class": dominant_class,
+            "dominant_count": dominant_count,
+            "purity": float(purity),
+        }
+
+        for i, cls in enumerate(class_names):
+            row[f"count_{cls}"] = int(mat[i, t])
+
+        results.append(row)
+
+    return results
+
+
+def save_router_type_metrics(out_dir: Path, metrics: List[Dict[str, Any]], class_names: List[str]):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = ["type_id", "size", "dominant_class", "dominant_count", "purity"] + [f"count_{c}" for c in class_names]
+
+    csv_path = out_dir / "router_type_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in metrics:
+            w.writerow(row)
+
+    txt_path = out_dir / "router_type_metrics.txt"
+    with open(txt_path, "w") as f:
+        f.write("Router type metrics\n")
+        f.write("=" * 80 + "\n")
+        for row in metrics:
+            f.write(
+                f"type_{row['type_id']:2d}  "
+                f"size={row['size']:4d}  "
+                f"dominant={row['dominant_class']:10s}  "
+                f"purity={row['purity']:.4f}\n"
+            )
+
+
+def compute_router_majority_vote_accuracy(
+    y_true: np.ndarray,
+    type_id: np.ndarray,
+    mat: np.ndarray
+) -> Tuple[float, np.ndarray, Dict[int, int]]:
+    """
+    Map each router type to its dominant true class, then compute a pseudo-classification accuracy.
+    This gives an interpretable router-only accuracy.
+    """
+    _, num_types = mat.shape
+    type_to_class: Dict[int, int] = {}
+
+    for t in range(num_types):
+        col = mat[:, t]
+        if col.sum() == 0:
+            type_to_class[t] = 0
+        else:
+            type_to_class[t] = int(np.argmax(col))
+
+    y_pred = np.array([type_to_class[int(t)] for t in type_id], dtype=int)
+    acc = float((y_pred == y_true).mean())
+    return acc, y_pred, type_to_class
+
+
+def save_router_majority_vote_results(
+    out_dir: Path,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    type_to_class: Dict[int, int],
+    class_names: List[str],
+    split_name: str = "all",
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    subdir = out_dir / f"router_majority_vote_{split_name}"
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    save_confusion_matrix(subdir, cm)
+
+    per_class_metrics = compute_per_class_metrics(cm, class_names)
+    save_per_class_metrics(subdir, per_class_metrics)
+
+    csv_path = out_dir / f"router_type_to_class_mapping_{split_name}.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["type_id", "mapped_class_id", "mapped_class_name"])
+        for t in sorted(type_to_class.keys()):
+            cid = int(type_to_class[t])
+            w.writerow([t, cid, class_names[cid]])
+
+
+# =========================
+# Tau gating evaluation
+# =========================
+def eval_good_gate(y_true_mult: np.ndarray, proba: np.ndarray, tau: float):
+    """
+    Gate to GOOD if p_good >= tau, else predict best defect class.
+    Returns: (metrics_dict, cm_mult, y_pred_mult)
+    """
+    y_true_mult = np.asarray(y_true_mult, dtype=int)
+    p_good = proba[:, 0]
+
+    defect_pred = 1 + np.argmax(proba[:, 1:], axis=1)
+    y_pred = defect_pred.copy()
+    y_pred[p_good >= tau] = 0
+
+    y_true_bin = (y_true_mult != 0).astype(int)
+    defect_score = 1.0 - p_good
+
+    out = {
+        "tau": float(tau),
+        "AUROC": float(roc_auc_score(y_true_bin, defect_score)),
+        "AP": float(average_precision_score(y_true_bin, defect_score)),
+        "Acc": float(accuracy_score(y_true_mult, y_pred)),
+    }
+
+    cm_bin = confusion_matrix(y_true_bin, (y_pred != 0).astype(int), labels=[0, 1])
+    tn, fp, fn, tp = cm_bin.ravel()
+    out["FPR_good"] = float(fp / (fp + tn + 1e-12))
+    out["TPR_defect"] = float(tp / (tp + fn + 1e-12))
+
+    cm_mult = confusion_matrix(y_true_mult, y_pred, labels=list(range(proba.shape[1])))
+    return out, cm_mult, y_pred
+
+
+def pick_tau_constraint_first(
+    y_true_mult: np.ndarray,
+    proba: np.ndarray,
+    taus: np.ndarray,
+    fpr_max: float,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Constraint-first:
+      - consider taus with FPR_good <= fpr_max
+      - among them maximize TPR_defect
+      - tie-breaker: Acc
+    If none satisfy, fallback to best Acc.
+    """
+    best_by_acc = (-1.0, None)
+    best_under = None
+
+    for tau in taus:
+        m, _, _ = eval_good_gate(y_true_mult, proba, tau=float(tau))
+
+        if m["Acc"] > best_by_acc[0]:
+            best_by_acc = (m["Acc"], m)
+
+        if m["FPR_good"] <= fpr_max:
+            cand = (m["TPR_defect"], m["Acc"], m)
+            if (best_under is None) or (cand[0] > best_under[0]) or (cand[0] == best_under[0] and cand[1] > best_under[1]):
+                best_under = cand
+
+    if best_under is not None:
+        return float(best_under[2]["tau"]), best_under[2]
+    return float(best_by_acc[1]["tau"]), best_by_acc[1]
+
+
+# =========================
+# Classifier factory
+# =========================
+def make_classifier(backend: str, *, C_value: float, balanced: bool, seed: int) -> Any:
+    backend = backend.lower().strip()
+
+    if backend == "lr":
+        kw = dict(max_iter=4000, n_jobs=-1, C=C_value, random_state=seed)
+        kw["class_weight"] = "balanced" if balanced else None
+        return LogisticRegression(**kw)
+
+    if backend == "lgbm":
+        if not _HAS_LGB:
+            raise RuntimeError("LightGBM is not installed. Run: pip install lightgbm")
+        cw = "balanced" if balanced else None
+        return lgb.LGBMClassifier(
+            objective="multiclass",
+            num_class=len(CLASS_NAMES),
+            n_estimators=600,
+            learning_rate=0.05,
+            num_leaves=63,
+            max_depth=-1,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_lambda=1.0,
+            class_weight=cw,
+            random_state=seed,
+            n_jobs=-1,
+        )
+
+    raise ValueError(f"Unknown CLASSIFIER_BACKEND={backend!r}. Use 'lr' or 'lgbm'.")
+
+
+def proba_to_global(model: Any, X_one: np.ndarray, Cn: int) -> np.ndarray:
+    p_local = model.predict_proba(X_one)[0]
+    if hasattr(model, "classes_"):
+        cls_local = np.asarray(model.classes_, dtype=int)
+        p_global = np.zeros(Cn, dtype=float)
+        p_global[cls_local] = p_local
+        return p_global
+
+    if len(p_local) == Cn:
+        return np.asarray(p_local, dtype=float)
+
+    raise RuntimeError("Model does not expose classes_, cannot map local probs to global.")
+
+def proba_to_global_defect_classes(model: Any, X_one: np.ndarray, defect_class_ids: List[int], Cn: int) -> np.ndarray:
+    """
+    Map defect-only classifier probabilities back to the full class space.
+    The classifier is trained only on defect classes, e.g. [1,2,5,6,7,8].
+    Output is length Cn, with class 0 (good) left as 0.
+    """
+    p_local = model.predict_proba(X_one)[0]
+    p_global = np.zeros(Cn, dtype=float)
+
+    if hasattr(model, "classes_"):
+        cls_local = np.asarray(model.classes_, dtype=int)
+        for c_local, p in zip(cls_local, p_local):
+            p_global[int(c_local)] = float(p)
+    else:
+        # fallback: assume order follows defect_class_ids
+        for c_global, p in zip(defect_class_ids, p_local):
+            p_global[int(c_global)] = float(p)
+
+    return p_global
+# =========================
+# Load once
+# =========================
+def load_global_and_patch_features() -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    Xg_list = []
+    Xp_list = []
+    ys = []
+    meta = []
+    global_idx = 0
+
+    for cls in CLASS_NAMES:
+        emb_path = GLOBAL_EMB_DIR / f"{cls}.npy"
+        img_dir = DATA_ROOT / cls
+        patch_dir = PATCH_ROOT / cls
+
+        if not emb_path.exists():
+            raise FileNotFoundError(f"Missing global embedding: {emb_path}")
+        if not img_dir.is_dir():
+            raise FileNotFoundError(f"Missing image folder: {img_dir}")
+        if not patch_dir.is_dir():
+            raise FileNotFoundError(f"Missing patch folder: {patch_dir}")
+
+        Xg = np.load(emb_path)
+        files = sorted(os.listdir(img_dir))
+        if len(files) != len(Xg):
+            raise ValueError(f"Mismatch in {cls}: files={len(files)} global={len(Xg)}")
+
+        pooled_list = []
+        for fn in files:
+            stem = Path(fn).stem
+            npz_path = patch_dir / f"{stem}.npz"
+            tokens = load_npz_one(npz_path, forced_key=PATCH_NPZ_KEY)
+            pooled = pool_patch_tokens(tokens, method=PATCH_POOL, topk=PATCH_TOPK)
+            pooled_list.append(pooled)
+
+            meta.append({
+                "source": cls,
+                "filename": fn,
+                "filepath": os.path.join(cls, fn),
+                "global_idx": global_idx
+            })
+            global_idx += 1
+
+        Xp = np.stack(pooled_list, axis=0)
+
+        Xg_list.append(Xg)
+        Xp_list.append(Xp)
+        ys.append(np.full(len(Xg), name2id[cls], dtype=int))
+
+        print(f"[Loaded] {cls}: global={Xg.shape}, patch_pooled={Xp.shape}")
+
+    X_global = np.concatenate(Xg_list, axis=0)
+    X_patch = np.concatenate(Xp_list, axis=0)
+    y_mult = np.concatenate(ys, axis=0)
+    return X_global, X_patch, y_mult, meta
+
+
+def build_features_with_alpha(X_global: np.ndarray, X_patch: np.ndarray, alpha: float):
+    """
+    Router always uses normalized global embeddings (X_router).
+    Classifier uses:
+      - if alpha==0: X_cls = Xg
+      - else:        X_cls = [Xg || alpha*Xp]
+    """
+    Xg = l2norm(X_global)
+    Xp = l2norm(X_patch)
+
+    if float(alpha) == 0.0:
+        X_cls = Xg
+    else:
+        X_cls = np.concatenate([Xg, alpha * Xp], axis=1)
+
+    return Xg, X_cls
+
+
+# =========================
+# One run
+# =========================
+def run_one_alpha(
+    alpha: float,
+    k_types: int,
+    c_value: float,
+    X_router,
+    X_cls,
+    y_mult,
+    meta,
+    tr,
+    te,
+    out_dir: Path
+) -> Dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    y_bin = (y_mult != 0).astype(int)
+
+    Xr_tr = X_router[tr]
+    Xc_tr, Xc_te_full = X_cls[tr], X_cls[te]
+    y_tr_mult, y_te_mult_full = y_mult[tr], y_mult[te]
+    y_tr_bin, y_te_bin_full = y_bin[tr], y_bin[te]
+
+    # -----------------------
+    # Router (KMeans on GOOD-train only)
+    # -----------------------
+    X_good_tr = Xr_tr[y_tr_mult == 0]
+
+    if X_good_tr.shape[0] < 2:
+        raise ValueError(f"#GOOD_train too small: {X_good_tr.shape[0]}")
+
+    if k_types > X_good_tr.shape[0]:
+        if CLAMP_K_TO_GOOD_TRAIN:
+            print(f"[Warn] K_TYPES={k_types} > #GOOD_train={X_good_tr.shape[0]} -> clamped")
+            k_types = int(X_good_tr.shape[0])
+        else:
+            raise ValueError(f"K_TYPES={k_types} > #GOOD_train={X_good_tr.shape[0]}")
+
+    km = KMeans(n_clusters=k_types, random_state=SEED, n_init="auto").fit(X_good_tr)
+
+    type_all = km.predict(X_router)
+    type_tr = type_all[tr]
+    type_te_full = type_all[te]
+
+    split_all = np.array(["train"] * len(y_mult), dtype=object)
+    split_all[te] = "test"
+    export_types_csv(out_dir / "type_assignments.csv", meta, split_all, type_all)
+
+    # -----------------------
+    # Router confidence export
+    # -----------------------
+    router_eval_dir = out_dir / "router_eval"
+
+    conf_tr = compute_router_confidence_scores(X_router[tr], km)
+    conf_te = compute_router_confidence_scores(X_router[te], km)
+
+    meta_tr = [meta[i] for i in tr]
+    meta_te = [meta[i] for i in te]
+
+    save_router_confidence_csv(
+        router_eval_dir / "train" / "router_confidence_scores.csv",
+        meta_tr,
+        "train",
+        y_tr_mult,
+        conf_tr,
+        CLASS_NAMES,
+    )
+
+    save_router_confidence_csv(
+        router_eval_dir / "test" / "router_confidence_scores.csv",
+        meta_te,
+        "test",
+        y_te_mult_full,
+        conf_te,
+        CLASS_NAMES,
+    )
+
+    save_router_hard_samples_csv(
+        router_eval_dir / "train" / f"router_hard_samples_by_{ROUTER_CONFIDENCE_SCORE}.csv",
+        meta_tr,
+        "train",
+        y_tr_mult,
+        conf_tr,
+        CLASS_NAMES,
+        top_n=ROUTER_HARD_TOP_N,
+        sort_by=ROUTER_CONFIDENCE_SCORE,
+    )
+
+    save_router_hard_samples_csv(
+        router_eval_dir / "test" / f"router_hard_samples_by_{ROUTER_CONFIDENCE_SCORE}.csv",
+        meta_te,
+        "test",
+        y_te_mult_full,
+        conf_te,
+        CLASS_NAMES,
+        top_n=ROUTER_HARD_TOP_N,
+        sort_by=ROUTER_CONFIDENCE_SCORE,
+    )
+
+    # 保留另外两种导出，方便分析
+    if ROUTER_CONFIDENCE_SCORE != "softmax_conf":
+        save_router_hard_samples_csv(
+            router_eval_dir / "test" / "router_hard_samples_by_softmax_conf.csv",
+            meta_te, "test", y_te_mult_full, conf_te, CLASS_NAMES,
+            top_n=ROUTER_HARD_TOP_N, sort_by="softmax_conf"
+        )
+    if ROUTER_CONFIDENCE_SCORE != "margin":
+        save_router_hard_samples_csv(
+            router_eval_dir / "test" / "router_hard_samples_by_margin.csv",
+            meta_te, "test", y_te_mult_full, conf_te, CLASS_NAMES,
+            top_n=ROUTER_HARD_TOP_N, sort_by="margin"
+        )
+    if ROUTER_CONFIDENCE_SCORE != "entropy":
+        save_router_hard_samples_csv(
+            router_eval_dir / "test" / "router_hard_samples_by_entropy.csv",
+            meta_te, "test", y_te_mult_full, conf_te, CLASS_NAMES,
+            top_n=ROUTER_HARD_TOP_N, sort_by="entropy"
+        )
+
+    print(
+        f"[Router {ROUTER_CONFIDENCE_SCORE} stats] "
+        f"min={conf_te[ROUTER_CONFIDENCE_SCORE].min():.6f} "
+        f"p5={np.percentile(conf_te[ROUTER_CONFIDENCE_SCORE], 5):.6f} "
+        f"p25={np.percentile(conf_te[ROUTER_CONFIDENCE_SCORE], 25):.6f} "
+        f"median={np.median(conf_te[ROUTER_CONFIDENCE_SCORE]):.6f} "
+        f"p75={np.percentile(conf_te[ROUTER_CONFIDENCE_SCORE], 75):.6f} "
+        f"max={conf_te[ROUTER_CONFIDENCE_SCORE].max():.6f}"
+    )
+
+    # -----------------------
+    # Router evaluation (full test set)
+    # -----------------------
+    mat_tr = save_router_class_type_matrix(
+        router_eval_dir / "train",
+        y_tr_mult,
+        type_tr,
+        CLASS_NAMES,
+        k_types
+    )
+    metrics_tr = compute_router_type_metrics(mat_tr, CLASS_NAMES)
+    save_router_type_metrics(router_eval_dir / "train", metrics_tr, CLASS_NAMES)
+
+    router_acc_tr, y_pred_router_tr, type_to_class_tr = compute_router_majority_vote_accuracy(
+        y_tr_mult, type_tr, mat_tr
+    )
+    save_router_majority_vote_results(
+        router_eval_dir / "train",
+        y_tr_mult,
+        y_pred_router_tr,
+        type_to_class_tr,
+        CLASS_NAMES,
+        split_name="train"
+    )
+
+    mat_te = save_router_class_type_matrix(
+        router_eval_dir / "test",
+        y_te_mult_full,
+        type_te_full,
+        CLASS_NAMES,
+        k_types
+    )
+    metrics_te = compute_router_type_metrics(mat_te, CLASS_NAMES)
+    save_router_type_metrics(router_eval_dir / "test", metrics_te, CLASS_NAMES)
+
+    router_acc_te, y_pred_router_te, type_to_class_te = compute_router_majority_vote_accuracy(
+        y_te_mult_full, type_te_full, mat_te
+    )
+    save_router_majority_vote_results(
+        router_eval_dir / "test",
+        y_te_mult_full,
+        y_pred_router_te,
+        type_to_class_te,
+        CLASS_NAMES,
+        split_name="test"
+    )
+
+    router_mean_purity_tr = float(np.mean([m["purity"] for m in metrics_tr])) if len(metrics_tr) else 0.0
+    router_mean_purity_te = float(np.mean([m["purity"] for m in metrics_te])) if len(metrics_te) else 0.0
+
+    total_size_tr = max(1, np.sum([m["size"] for m in metrics_tr]))
+    total_size_te = max(1, np.sum([m["size"] for m in metrics_te]))
+
+    router_weighted_purity_tr = float(np.sum([m["purity"] * m["size"] for m in metrics_tr]) / total_size_tr)
+    router_weighted_purity_te = float(np.sum([m["purity"] * m["size"] for m in metrics_te]) / total_size_te)
+
+    # -----------------------
+    # Manual-review exclusion BEFORE classification
+    # -----------------------
+    if ENABLE_MANUAL_REVIEW_EXCLUSION:
+        manual_review_mask = get_manual_review_mask_from_router_conf(
+            conf_te,
+            mode=MANUAL_REVIEW_MODE,
+            score_name=ROUTER_CONFIDENCE_SCORE,
+            threshold=ROUTER_CONFIDENCE_THRESHOLD,
+            top_n=ROUTER_HARD_TOP_N,
+        )
+    else:
+        manual_review_mask = np.zeros(len(te), dtype=bool)
+
+    keep_mask = ~manual_review_mask
+
+    n_total_test = int(len(te))
+    n_manual_review = int(np.sum(manual_review_mask))
+    n_kept_test = int(np.sum(keep_mask))
+    manual_review_rate = float(n_manual_review / max(1, n_total_test))
+
+    dummy_pred_for_review = np.zeros(len(te), dtype=int)
+    save_manual_review_samples_csv(
+        out_dir / "manual_review_samples_test.csv",
+        meta_te,
+        y_te_mult_full,
+        dummy_pred_for_review,
+        type_te_full,
+        conf_te,
+        CLASS_NAMES,
+        manual_review_mask,
+        split_name="test",
+    )
+
+    if n_kept_test == 0:
+        raise ValueError("All test samples were routed to manual review; no samples left for classification.")
+
+    # kept test subset only
+    Xc_te = Xc_te_full[keep_mask]
+    y_te_mult = y_te_mult_full[keep_mask]
+    y_te_bin = y_te_bin_full[keep_mask]
+    type_te = type_te_full[keep_mask]
+    meta_te_kept = [meta_te[i] for i in np.where(keep_mask)[0]]
+    conf_te_kept = {k: v[keep_mask] for k, v in conf_te.items()}
+
+    # -----------------------
+    # Train classifiers
+    # -----------------------
+    stats: Dict[int, int] = {}
+
+    if USE_HIERARCHICAL_CLASSIFICATION:
+        # ===== hierarchical =====
+        bin_clf_global = make_classifier(
+            CLASSIFIER_BACKEND,
+            C_value=c_value,
+            balanced=USE_BALANCED,
+            seed=SEED
+        )
+        bin_clf_global.fit(Xc_tr, y_tr_bin)
+
+        defect_train_idx_global = np.where(y_tr_mult != 0)[0]
+        if len(defect_train_idx_global) == 0:
+            raise ValueError("No defect samples in training set.")
+
+        def_clf_global = make_classifier(
+            CLASSIFIER_BACKEND,
+            C_value=c_value,
+            balanced=False,
+            seed=SEED
+        )
+        def_clf_global.fit(Xc_tr[defect_train_idx_global], y_tr_mult[defect_train_idx_global])
+
+        bin_clfs: Dict[int, Any] = {}
+        def_clfs: Dict[int, Any] = {}
+        defect_stats: Dict[int, int] = {}
+
+        for k in range(k_types):
+            idx_k = np.where(type_tr == k)[0]
+            n = int(len(idx_k))
+            stats[k] = n
+
+            if n >= MIN_SAMPLES_PER_TYPE:
+                clf_bin_k = make_classifier(
+                    CLASSIFIER_BACKEND,
+                    C_value=c_value,
+                    balanced=False,
+                    seed=SEED
+                )
+                clf_bin_k.fit(Xc_tr[idx_k], y_tr_bin[idx_k])
+                bin_clfs[k] = clf_bin_k
+
+            idx_k_def = idx_k[y_tr_mult[idx_k] != 0]
+            defect_stats[k] = int(len(idx_k_def))
+
+            if len(idx_k_def) >= MIN_SAMPLES_PER_TYPE and len(np.unique(y_tr_mult[idx_k_def])) >= 2:
+                clf_def_k = make_classifier(
+                    CLASSIFIER_BACKEND,
+                    C_value=c_value,
+                    balanced=False,
+                    seed=SEED
+                )
+                clf_def_k.fit(Xc_tr[idx_k_def], y_tr_mult[idx_k_def])
+                def_clfs[k] = clf_def_k
+    else:
+        # ===== original single-stage multiclass =====
+        clf_global = make_classifier(
+            CLASSIFIER_BACKEND,
+            C_value=c_value,
+            balanced=USE_BALANCED,
+            seed=SEED
+        )
+        clf_global.fit(Xc_tr, y_tr_mult)
+
+        clfs: Dict[int, Any] = {}
+        for k in range(k_types):
+            idx_k = np.where(type_tr == k)[0]
+            n = int(len(idx_k))
+            stats[k] = n
+
+            if n < MIN_SAMPLES_PER_TYPE:
+                continue
+
+            clf_k = make_classifier(
+                CLASSIFIER_BACKEND,
+                C_value=c_value,
+                balanced=False,
+                seed=SEED
+            )
+            clf_k.fit(Xc_tr[idx_k], y_tr_mult[idx_k])
+            clfs[k] = clf_k
+
+    # -----------------------
+    # Predict on KEPT TEST samples
+    # -----------------------
+    Cn = len(CLASS_NAMES)
+    proba = np.zeros((len(y_te_mult), Cn), dtype=float)
+    pred_argmax = np.zeros(len(y_te_mult), dtype=int)
+
+    if USE_HIERARCHICAL_CLASSIFICATION:
+        # ===== hierarchical prediction =====
+        for i in range(len(y_te_mult)):
+            k = int(type_te[i])
+
+            clf_bin = bin_clfs.get(k, bin_clf_global)
+            p_bin_local = clf_bin.predict_proba(Xc_te[i:i+1])[0]
+
+            p_good = 0.0
+            p_defect = 0.0
+            cls_bin = np.asarray(clf_bin.classes_, dtype=int)
+            for cls_val, p in zip(cls_bin, p_bin_local):
+                if int(cls_val) == 0:
+                    p_good = float(p)
+                elif int(cls_val) == 1:
+                    p_defect = float(p)
+
+            clf_def = def_clfs.get(k, def_clf_global)
+            p_def_only = proba_to_global_defect_classes(
+                clf_def,
+                Xc_te[i:i+1],
+                defect_class_ids=list(range(1, Cn)),
+                Cn=Cn
+            )
+
+            p_full = np.zeros(Cn, dtype=float)
+            p_full[0] = p_good
+
+            defect_sum = p_def_only[1:].sum()
+            if defect_sum > 0:
+                p_full[1:] = p_defect * (p_def_only[1:] / defect_sum)
+            else:
+                p_full[1:] = p_defect / (Cn - 1)
+
+            proba[i] = p_full
+            pred_argmax[i] = int(np.argmax(p_full))
+    else:
+        # ===== original single-stage multiclass prediction =====
+        for i in range(len(y_te_mult)):
+            k = int(type_te[i])
+            clf = clfs.get(k, clf_global)
+            p_global = proba_to_global(clf, Xc_te[i:i+1], Cn=Cn)
+            proba[i] = p_global
+            pred_argmax[i] = int(np.argmax(p_global))
+
+    # -----------------------
+    # Base metrics (argmax) on kept samples only
+    # -----------------------
+    defect_score = 1.0 - proba[:, 0]
+    auroc = float(roc_auc_score(y_te_bin, defect_score))
+    ap = float(average_precision_score(y_te_bin, defect_score))
+    acc = float(accuracy_score(y_te_mult, pred_argmax))
+    cm = confusion_matrix(y_te_mult, pred_argmax, labels=list(range(Cn)))
+
+    save_confusion_matrix(out_dir, cm)
+    per_class_metrics = compute_per_class_metrics(cm, CLASS_NAMES)
+    save_per_class_metrics(out_dir, per_class_metrics)
+
+    excl_dir = out_dir / "excluding_manual_review"
+    save_confusion_matrix(excl_dir, cm)
+    save_per_class_metrics(excl_dir, per_class_metrics)
+
+    with open(excl_dir / "exclusion_summary.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        w.writerow(["n_total_test", n_total_test])
+        w.writerow(["n_manual_review", n_manual_review])
+        w.writerow(["n_kept_test", n_kept_test])
+        w.writerow(["manual_review_rate", manual_review_rate])
+        w.writerow(["auto_coverage", n_kept_test / max(1, n_total_test)])
+        w.writerow(["router_confidence_score", ROUTER_CONFIDENCE_SCORE])
+        w.writerow(["router_confidence_threshold", ROUTER_CONFIDENCE_THRESHOLD])
+        w.writerow(["manual_review_mode", MANUAL_REVIEW_MODE])
+
+    with open(out_dir / "test_predictions.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "source", "filename", "filepath", "global_idx",
+            "type_id", "true_class", "pred_class",
+            "p_good", "p_pred", "router_score"
+        ])
+        for i, row in enumerate(meta_te_kept):
+            w.writerow([
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                int(type_te[i]),
+                CLASS_NAMES[int(y_te_mult[i])],
+                CLASS_NAMES[int(pred_argmax[i])],
+                float(proba[i, 0]),
+                float(proba[i, pred_argmax[i]]),
+                float(conf_te_kept[ROUTER_CONFIDENCE_SCORE][i]),
+            ])
+
+    with open(excl_dir / "test_predictions_kept_only.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "source", "filename", "filepath", "global_idx",
+            "type_id", "true_class", "pred_class",
+            "p_good", "p_pred", "router_score"
+        ])
+        for i, row in enumerate(meta_te_kept):
+            w.writerow([
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                int(type_te[i]),
+                CLASS_NAMES[int(y_te_mult[i])],
+                CLASS_NAMES[int(pred_argmax[i])],
+                float(proba[i, 0]),
+                float(proba[i, pred_argmax[i]]),
+                float(conf_te_kept[ROUTER_CONFIDENCE_SCORE][i]),
+            ])
+
+    type_real_pred_rows = compute_type_real_pred_table(
+        type_id=type_te,
+        y_true=y_te_mult,
+        y_pred=pred_argmax,
+        class_names=CLASS_NAMES,
+        k_types=k_types,
+    )
+    save_type_real_pred_table(out_dir / "type_real_vs_pred_table_test.csv", type_real_pred_rows, CLASS_NAMES)
+    save_type_real_pred_table(excl_dir / "type_real_vs_pred_table_test.csv", type_real_pred_rows, CLASS_NAMES)
+
+    save_typewise_confusion_matrices(
+        out_dir / "typewise_confusion_test",
+        type_te, y_te_mult, pred_argmax, CLASS_NAMES, k_types,
+    )
+    save_typewise_confusion_matrices(
+        excl_dir / "typewise_confusion_test",
+        type_te, y_te_mult, pred_argmax, CLASS_NAMES, k_types,
+    )
+
+    # -----------------------
+    # Tau tuning on kept samples
+    # -----------------------
+    tau_csv = out_dir / "tau_sweep.csv"
+    with open(tau_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["tau", "AUROC", "AP", "Acc", "FPR_good", "TPR_defect"])
+        for tau in TAUS:
+            m, _, _ = eval_good_gate(y_te_mult, proba, tau=float(tau))
+            w.writerow([
+                f"{m['tau']:.6f}",
+                f"{m['AUROC']:.6f}",
+                f"{m['AP']:.6f}",
+                f"{m['Acc']:.6f}",
+                f"{m['FPR_good']:.6f}",
+                f"{m['TPR_defect']:.6f}",
+            ])
+
+    best_tau, best_tau_metrics = pick_tau_constraint_first(
+        y_true_mult=y_te_mult,
+        proba=proba,
+        taus=TAUS,
+        fpr_max=FPR_MAX_GLOBAL_TAU,
+    )
+
+    _, cm_best, pred_best_tau = eval_good_gate(y_te_mult, proba, tau=float(best_tau))
+    best_dir = out_dir / f"best_tau_{best_tau:.4f}"
+    best_excl_dir = excl_dir / f"best_tau_{best_tau:.4f}"
+
+    save_confusion_matrix(best_dir, cm_best)
+    save_per_class_metrics(best_dir, compute_per_class_metrics(cm_best, CLASS_NAMES))
+    save_confusion_matrix(best_excl_dir, cm_best)
+    save_per_class_metrics(best_excl_dir, compute_per_class_metrics(cm_best, CLASS_NAMES))
+
+    with open(out_dir / "test_predictions_best_tau.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "source", "filename", "filepath", "global_idx",
+            "type_id", "true_class", "pred_class",
+            "p_good", "p_pred", "tau", "router_score"
+        ])
+        for i, row in enumerate(meta_te_kept):
+            pred_i = int(pred_best_tau[i])
+            w.writerow([
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                int(type_te[i]),
+                CLASS_NAMES[int(y_te_mult[i])],
+                CLASS_NAMES[pred_i],
+                float(proba[i, 0]),
+                float(proba[i, pred_i]),
+                float(best_tau),
+                float(conf_te_kept[ROUTER_CONFIDENCE_SCORE][i]),
+            ])
+
+    with open(best_excl_dir / "test_predictions_best_tau_kept_only.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "source", "filename", "filepath", "global_idx",
+            "type_id", "true_class", "pred_class",
+            "p_good", "p_pred", "tau", "router_score"
+        ])
+        for i, row in enumerate(meta_te_kept):
+            pred_i = int(pred_best_tau[i])
+            w.writerow([
+                row["source"],
+                row["filename"],
+                row["filepath"],
+                row["global_idx"],
+                int(type_te[i]),
+                CLASS_NAMES[int(y_te_mult[i])],
+                CLASS_NAMES[pred_i],
+                float(proba[i, 0]),
+                float(proba[i, pred_i]),
+                float(best_tau),
+                float(conf_te_kept[ROUTER_CONFIDENCE_SCORE][i]),
+            ])
+
+    type_real_pred_rows_best_tau = compute_type_real_pred_table(
+        type_id=type_te,
+        y_true=y_te_mult,
+        y_pred=pred_best_tau,
+        class_names=CLASS_NAMES,
+        k_types=k_types,
+    )
+    save_type_real_pred_table(out_dir / "type_real_vs_pred_table_test_best_tau.csv", type_real_pred_rows_best_tau, CLASS_NAMES)
+    save_type_real_pred_table(best_excl_dir / "type_real_vs_pred_table_test_best_tau.csv", type_real_pred_rows_best_tau, CLASS_NAMES)
+
+    save_typewise_confusion_matrices(
+        best_dir / "typewise_confusion_test",
+        type_te, y_te_mult, pred_best_tau, CLASS_NAMES, k_types,
+    )
+    save_typewise_confusion_matrices(
+        best_excl_dir / "typewise_confusion_test",
+        type_te, y_te_mult, pred_best_tau, CLASS_NAMES, k_types,
+    )
+
+    # -----------------------
+    # Coverage / hybrid metrics
+    # -----------------------
+    auto_coverage = float(n_kept_test / max(1, n_total_test))
+    correct_auto = int(np.sum(pred_argmax == y_te_mult))
+    hybrid_accuracy = float((correct_auto + n_manual_review) / max(1, n_total_test))
+
+    print(
+        f"[Manual review] excluded={n_manual_review}/{n_total_test} "
+        f"({manual_review_rate:.2%}), kept={n_kept_test}"
+    )
+    print(
+        f"[Best tau (constraint-first, FPR<= {FPR_MAX_GLOBAL_TAU:.2%})] "
+        f"tau={best_tau:.4f} Acc={best_tau_metrics['Acc']:.4f} "
+        f"FPR_good={best_tau_metrics['FPR_good']:.4f} TPR_defect={best_tau_metrics['TPR_defect']:.4f}"
+    )
+
+    sizes = np.array([stats.get(k, 0) for k in range(k_types)], dtype=int) if k_types > 0 else np.array([], dtype=int)
+
+    summary = {
+        "CLASSIFIER_BACKEND": str(CLASSIFIER_BACKEND),
+        "USE_BALANCED": int(bool(USE_BALANCED)),
+        "UseHierarchicalClassification": int(bool(USE_HIERARCHICAL_CLASSIFICATION)),
+        "alpha": float(alpha),
+        "K_TYPES": int(k_types),
+        "C_VALUE": float(c_value),
+        "MIN_SAMPLES_PER_TYPE": int(MIN_SAMPLES_PER_TYPE),
+        "PATCH_POOL": str(PATCH_POOL),
+        "PATCH_TOPK": int(PATCH_TOPK),
+
+        "X_global_dim": int(X_router.shape[1]),
+        "X_cls_dim": int(X_cls.shape[1]),
+        "X_patch_dim": int(X_cls.shape[1] - X_router.shape[1]) if X_cls.shape[1] >= X_router.shape[1] else 0,
+
+        "RouterAccTrain": float(router_acc_tr),
+        "RouterAccTest": float(router_acc_te),
+        "RouterMeanPurityTrain": float(router_mean_purity_tr),
+        "RouterMeanPurityTest": float(router_mean_purity_te),
+        "RouterWeightedPurityTrain": float(router_weighted_purity_tr),
+        "RouterWeightedPurityTest": float(router_weighted_purity_te),
+
+        "ManualReviewEnabled": int(bool(ENABLE_MANUAL_REVIEW_EXCLUSION)),
+        "ManualReviewMode": str(MANUAL_REVIEW_MODE),
+        "RouterConfidenceScore": str(ROUTER_CONFIDENCE_SCORE),
+        "RouterConfidenceThreshold": float(ROUTER_CONFIDENCE_THRESHOLD),
+        "RouterHardTopN": int(ROUTER_HARD_TOP_N),
+        "ManualReviewExcludedCount": int(n_manual_review),
+        "ManualReviewExcludedRate": float(manual_review_rate),
+        "AutoClassifiedCount": int(n_kept_test),
+        "AutoCoverage": float(auto_coverage),
+        "HybridAccuracy": float(hybrid_accuracy),
+
+        "AUROC": float(auroc),
+        "AP": float(ap),
+        "Acc(argmax)": float(acc),
+
+        "FPR_MAX_GLOBAL_TAU": float(FPR_MAX_GLOBAL_TAU),
+        "BestTau": float(best_tau),
+        "Acc@BestTau": float(best_tau_metrics["Acc"]),
+        "FPR_good@BestTau": float(best_tau_metrics["FPR_good"]),
+        "TPR_defect@BestTau": float(best_tau_metrics["TPR_defect"]),
+
+        "trained_type_clfs": int(len(bin_clfs) if USE_HIERARCHICAL_CLASSIFICATION else len(clfs)),
+        "trained_defect_type_clfs": int(len(def_clfs) if USE_HIERARCHICAL_CLASSIFICATION else 0),
+        "fallback_types": int(k_types - (len(bin_clfs) if USE_HIERARCHICAL_CLASSIFICATION else len(clfs))),
+        "cluster_min": int(sizes.min()) if sizes.size else 0,
+        "cluster_med": float(np.median(sizes)) if sizes.size else 0.0,
+        "cluster_max": int(sizes.max()) if sizes.size else 0,
+    }
+
+    with open(out_dir / "summary.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(list(summary.keys()))
+        w.writerow([summary[k] for k in summary.keys()])
+
+    return summary
+
+def main():
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if K_STEP == 0:
+        raise ValueError("K_STEP cannot be 0")
+    if (K_MIN <= K_MAX and K_STEP < 0) or (K_MIN >= K_MAX and K_STEP > 0):
+        raise ValueError("K_STEP sign does not move from K_MIN toward K_MAX")
+
+    K_TYPES_LIST = list(range(K_MIN, K_MAX + (1 if K_STEP > 0 else -1), K_STEP))
+
+    print(f"[Config] DATA_ROOT={DATA_ROOT}")
+    print(f"[Config] GLOBAL_EMB_DIR={GLOBAL_EMB_DIR}")
+    print(f"[Config] PATCH_ROOT={PATCH_ROOT}")
+    print(f"[Config] PATCH_POOL={PATCH_POOL}, PATCH_TOPK={PATCH_TOPK}")
+    print(f"[Config] K sweep: K_MIN={K_MIN}, K_MAX={K_MAX}, K_STEP={K_STEP} -> {K_TYPES_LIST}")
+    print(
+        f"[Config] CLASSIFIER_BACKEND={CLASSIFIER_BACKEND}, C_VALUES={C_VALUES}, "
+        f"MIN_SAMPLES_PER_TYPE={MIN_SAMPLES_PER_TYPE}, USE_BALANCED={USE_BALANCED}"
+    )
+    print(f"[Config] ALPHAS={ALPHAS}")
+    print(f"[Config] FPR_MAX_GLOBAL_TAU={FPR_MAX_GLOBAL_TAU:.2%}")
+    print(f"[Config] USE_HIERARCHICAL_CLASSIFICATION={USE_HIERARCHICAL_CLASSIFICATION}")
+    print(
+        f"[Config] Manual review exclusion: enabled={ENABLE_MANUAL_REVIEW_EXCLUSION}, "
+        f"mode={MANUAL_REVIEW_MODE}, score={ROUTER_CONFIDENCE_SCORE}, "
+        f"threshold={ROUTER_CONFIDENCE_THRESHOLD}, top_n={ROUTER_HARD_TOP_N}"
+    )
+
+    if CLASSIFIER_BACKEND.lower() == "lgbm" and not _HAS_LGB:
+        raise RuntimeError("CLASSIFIER_BACKEND='lgbm' but lightgbm is not installed. Run: pip install lightgbm")
+
+    X_global, X_patch, y_mult, meta = load_global_and_patch_features()
+
+    y_bin = (y_mult != 0).astype(int)
+    idx = np.arange(len(y_mult))
+    tr, te = train_test_split(
+        idx,
+        test_size=TEST_SIZE,
+        random_state=SEED,
+        stratify=y_bin
+    )
+
+    summary_path = OUT_ROOT / "k_alpha_c_sweep_summary.csv"
+    header = [
+        "CLASSIFIER_BACKEND", "UseHierarchicalClassification", "K_TYPES", "alpha", "C_VALUE",
+
+        "RouterAccTrain", "RouterAccTest",
+        "RouterMeanPurityTrain", "RouterMeanPurityTest",
+        "RouterWeightedPurityTrain", "RouterWeightedPurityTest",
+
+        "AUROC", "AP", "Acc(argmax)",
+        "AutoCoverage", "HybridAccuracy",
+        "ManualReviewExcludedCount", "ManualReviewExcludedRate",
+
+        "RouterConfidenceScore", "RouterConfidenceThreshold", "RouterHardTopN",
+
+        "BestTau", "Acc@BestTau", "FPR_good@BestTau", "TPR_defect@BestTau",
+
+        "MIN_SAMPLES_PER_TYPE", "USE_BALANCED",
+        "PATCH_POOL", "PATCH_TOPK",
+        "trained_type_clfs", "trained_defect_type_clfs", "fallback_types",
+        "cluster_min", "cluster_med", "cluster_max",
+        "X_global_dim", "X_patch_dim", "X_cls_dim",
+        "is_best_by_hybrid_accuracy"
+    ]
+
+    best = None  # (HybridAccuracy, summary)
+    all_results = []
+
+    for k_types in K_TYPES_LIST:
+        print("\n==============================")
+        print(f"==== Sweeping K_TYPES={k_types} ====")
+        print("==============================")
+
+        for alpha in ALPHAS:
+            X_router, X_cls = build_features_with_alpha(
+                X_global,
+                X_patch,
+                alpha=float(alpha)
+            )
+            alpha_str = float_to_str(float(alpha))
+
+            for c_value in C_VALUES:
+                c_str = float_to_str(float(c_value))
+                out_dir = OUT_ROOT / f"k_{int(k_types):d}" / f"alpha_{alpha_str}" / f"C_{c_str}"
+
+                print(f"\n=== Running K_TYPES={k_types} alpha={alpha_str} C={c_str} -> {out_dir} ===")
+
+                summ = run_one_alpha(
+                    float(alpha),
+                    int(k_types),
+                    float(c_value),
+                    X_router,
+                    X_cls,
+                    y_mult,
+                    meta,
+                    tr,
+                    te,
+                    out_dir
+                )
+
+                all_results.append(summ)
+
+                score_for_selection = summ["HybridAccuracy"]
+                if best is None or score_for_selection > best[0]:
+                    best = (score_for_selection, summ)
+
+                print(
+                    f"K={summ['K_TYPES']} alpha={summ['alpha']:.3f} C={summ['C_VALUE']:.3f}  "
+                    f"Hier={summ['UseHierarchicalClassification']}  "
+                    f"RouterScore={summ['RouterConfidenceScore']}  "
+                    f"RouterAccTest={summ['RouterAccTest']:.4f}  "
+                    f"Acc(argmax)={summ['Acc(argmax)']:.4f}  "
+                    f"AutoCoverage={summ['AutoCoverage']:.4f}  "
+                    f"HybridAccuracy={summ['HybridAccuracy']:.4f}  "
+                    f"Excluded={summ['ManualReviewExcludedCount']}"
+                )
+
+    with open(summary_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+
+        for summ in all_results:
+            is_best = int(
+                best is not None
+                and summ["K_TYPES"] == best[1]["K_TYPES"]
+                and abs(summ["alpha"] - best[1]["alpha"]) < 1e-12
+                and abs(summ["C_VALUE"] - best[1]["C_VALUE"]) < 1e-12
+                and summ["UseHierarchicalClassification"] == best[1]["UseHierarchicalClassification"]
+                and summ["RouterConfidenceScore"] == best[1]["RouterConfidenceScore"]
+            )
+
+            w.writerow([
+                summ["CLASSIFIER_BACKEND"],
+                summ["UseHierarchicalClassification"],
+                summ["K_TYPES"],
+                f"{summ['alpha']:.6f}",
+                f"{summ['C_VALUE']:.6f}",
+
+                f"{summ['RouterAccTrain']:.6f}",
+                f"{summ['RouterAccTest']:.6f}",
+                f"{summ['RouterMeanPurityTrain']:.6f}",
+                f"{summ['RouterMeanPurityTest']:.6f}",
+                f"{summ['RouterWeightedPurityTrain']:.6f}",
+                f"{summ['RouterWeightedPurityTest']:.6f}",
+
+                f"{summ['AUROC']:.6f}",
+                f"{summ['AP']:.6f}",
+                f"{summ['Acc(argmax)']:.6f}",
+                f"{summ['AutoCoverage']:.6f}",
+                f"{summ['HybridAccuracy']:.6f}",
+                summ["ManualReviewExcludedCount"],
+                f"{summ['ManualReviewExcludedRate']:.6f}",
+
+                summ["RouterConfidenceScore"],
+                f"{summ['RouterConfidenceThreshold']:.6f}",
+                summ["RouterHardTopN"],
+
+                f"{summ['BestTau']:.6f}",
+                f"{summ['Acc@BestTau']:.6f}",
+                f"{summ['FPR_good@BestTau']:.6f}",
+                f"{summ['TPR_defect@BestTau']:.6f}",
+
+                summ["MIN_SAMPLES_PER_TYPE"],
+                summ["USE_BALANCED"],
+                summ["PATCH_POOL"],
+                summ["PATCH_TOPK"],
+                summ["trained_type_clfs"],
+                summ["trained_defect_type_clfs"],
+                summ["fallback_types"],
+                summ["cluster_min"],
+                f"{summ['cluster_med']:.1f}",
+                summ["cluster_max"],
+                summ["X_global_dim"],
+                summ["X_patch_dim"],
+                summ["X_cls_dim"],
+                is_best,
+            ])
+
+    if best is not None:
+        print("\n==== Best by Hybrid Accuracy (over K x alpha x C) ====")
+        for k, v in best[1].items():
+            print(f"{k}: {v}")
+
+        best_csv = OUT_ROOT / "best_config_by_hybrid_accuracy.csv"
+        with open(best_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(list(best[1].keys()))
+            w.writerow([best[1][k] for k in best[1].keys()])
+        print(f"[DONE] Best config saved: {best_csv}")
+
+        best_by_k = {}
+        for summ in all_results:
+            k = int(summ["K_TYPES"])
+            if k not in best_by_k or summ["HybridAccuracy"] > best_by_k[k]["HybridAccuracy"]:
+                best_by_k[k] = summ
+
+        best_by_k_csv = OUT_ROOT / "best_alpha_c_per_k_by_hybrid_accuracy.csv"
+        with open(best_by_k_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "K_TYPES", "UseHierarchicalClassification", "RouterConfidenceScore",
+                "best_alpha", "best_C_VALUE",
+                "Acc(argmax)", "AutoCoverage", "HybridAccuracy",
+                "AUROC", "AP", "Acc@BestTau",
+                "RouterAccTest", "RouterWeightedPurityTest"
+            ])
+            for k in sorted(best_by_k.keys()):
+                s = best_by_k[k]
+                w.writerow([
+                    s["K_TYPES"],
+                    s["UseHierarchicalClassification"],
+                    s["RouterConfidenceScore"],
+                    f"{s['alpha']:.6f}",
+                    f"{s['C_VALUE']:.6f}",
+                    f"{s['Acc(argmax)']:.6f}",
+                    f"{s['AutoCoverage']:.6f}",
+                    f"{s['HybridAccuracy']:.6f}",
+                    f"{s['AUROC']:.6f}",
+                    f"{s['AP']:.6f}",
+                    f"{s['Acc@BestTau']:.6f}",
+                    f"{s['RouterAccTest']:.6f}",
+                    f"{s['RouterWeightedPurityTest']:.6f}",
+                ])
+        print(f"[DONE] Best alpha/C per K saved: {best_by_k_csv}")
+
+    print(f"\n[DONE] Sweep summary saved: {summary_path}")
+    print(f"[DONE] Per-run outputs under: {OUT_ROOT}/k_*/alpha_*/C_*/")
+
+if __name__ == "__main__":
+    main()
