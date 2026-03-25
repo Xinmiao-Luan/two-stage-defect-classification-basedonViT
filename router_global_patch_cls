@@ -1,21 +1,3 @@
-# router_global_concat_patch_alpha_sweep_clf.py
-# Baseline C:
-#   - Router (KMeans) on GLOBAL embeddings (DINOv2 global)
-#   - Classifier (choose: LR / LightGBM) on CONCAT features: [Xg || alpha*Xp]
-#     where Xp is pooled patch tokens (DINOv2 patch tokens)
-#
-# Adds:
-#   - Sweep K_TYPES via K_MIN..K_MAX (inclusive) with step K_STEP
-#   - Save confusion matrix + per-class metrics for final classifier
-#   - Save router-step evaluation:
-#       * class-vs-type contingency matrix
-#       * type purity / dominant class
-#       * router majority-vote confusion matrix and per-class metrics
-#   - Choose best parameter setting by final Acc(argmax)
-#
-# Keeps:
-#   - global good-gate tau sweep (single tau) with FPR<=5% constraint
-#
 # Outputs per (K, alpha):
 #   OUT_ROOT/k_<K>/alpha_<a>/
 #       type_assignments.csv
