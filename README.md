@@ -6,7 +6,7 @@ This repository contains a two-stage machine learning pipeline developed for the
 
 The proposed system combines pretrained visual embeddings, unsupervised routing, and specialized downstream classifiers:
 
-1. DINOv2 (frozen Vision Transformer) extracts both global CLS embeddings and local patch-level features.
+1. DINOv2 extracts both global CLS embeddings and local patch-level features.
 2. KMeans clustering routes samples into visually coherent groups.
 3. Specialized per-cluster classifiers perform defect prediction within each routed subset.
 4. A confidence-aware inference module flags ambiguous cases for manual review.
