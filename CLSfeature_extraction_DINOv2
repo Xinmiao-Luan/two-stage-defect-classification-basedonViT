@@ -1,0 +1,105 @@
+import os
+import argparse
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+from torchvision import transforms
+
+# -----------------------
+# DINOv2 loader (torch hub)
+# -----------------------
+def load_dinov2(model_name: str, device: str):
+    # Example names often used: "dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"
+    model = torch.hub.load("facebookresearch/dinov2", model_name, pretrained=True)
+    model.eval()
+    model.to(device)
+    return model
+
+@torch.no_grad()
+def embed_views(model, img_pil: Image.Image, tfms, n_views: int, device: str):
+    feats = []
+    for _ in range(n_views):
+        x = tfms(img_pil).unsqueeze(0).to(device)  # (1,3,H,W)
+        y = model(x)  # typically (1, D) for DINOv2
+        feats.append(y.squeeze(0).float().cpu().numpy())
+    feats = np.stack(feats, axis=0)  # (n_views, D)
+    return feats.mean(axis=0)        # (D,)
+
+def build_transforms(img_size: int, strength: str):
+    # Keep these realistic for wafers/packages: mild geometry + mild photometric
+    if strength == "mild":
+        jitter = transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.05, hue=0.02)
+        rot = 10
+        scale = (0.9, 1.0)
+    elif strength == "strong":
+        jitter = transforms.ColorJitter(brightness=0.30, contrast=0.30, saturation=0.10, hue=0.05)
+        rot = 20
+        scale = (0.8, 1.0)
+    else:
+        raise ValueError("strength must be mild/strong")
+
+    tfms = transforms.Compose([
+        transforms.RandomResizedCrop(img_size, scale=scale),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(rot),
+        transforms.RandomApply([jitter], p=0.8),
+        transforms.ToTensor(),
+        # ImageNet normalization is typically fine for DINOv2
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+    return tfms
+
+def list_images(folder: str):
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    files = []
+    for fn in os.listdir(folder):
+        if os.path.splitext(fn.lower())[1] in exts:
+            files.append(fn)
+    return sorted(files)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", type=str, default="Data")
+    ap.add_argument("--out_dir", type=str, default="embeddings_dinov2_aug")
+    ap.add_argument("--model_name", type=str, default="dinov2_vitb14")
+    ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--n_views", type=int, default=8)
+    ap.add_argument("--strength", type=str, default="mild", choices=["mild", "strong"])
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--classes", type=str, default="good,defect1,defect2,defect3,defect4,defect5,defect8,defect9,defect10")
+    args = ap.parse_args()
+
+    classes = [c.strip() for c in args.classes.split(",") if c.strip()]
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    model = load_dinov2(args.model_name, args.device)
+    tfms = build_transforms(args.img_size, args.strength)
+
+    for cls in classes:
+        cls_dir = os.path.join(args.data_root, cls)
+        if not os.path.isdir(cls_dir):
+            print(f"[Skip] missing folder: {cls_dir}")
+            continue
+
+        files = list_images(cls_dir)
+        if not files:
+            print(f"[Skip] no images in: {cls_dir}")
+            continue
+
+        feats = []
+        for fn in tqdm(files, desc=f"Embedding {cls}", leave=True):
+            path = os.path.join(cls_dir, fn)
+            img = Image.open(path).convert("RGB")
+            v = embed_views(model, img, tfms, n_views=args.n_views, device=args.device)
+            feats.append(v)
+
+        feats = np.stack(feats, axis=0)  # (N, D)
+        out_path = os.path.join(args.out_dir, f"{cls}.npy")
+        np.save(out_path, feats)
+        print(f"[Saved] {out_path} shape={feats.shape}")
+
+if __name__ == "__main__":
+    main()
