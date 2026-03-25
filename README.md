@@ -1,6 +1,6 @@
 # two-stage-defect-classification-basedonViT
 
-This repository contains a two-stage machine learning pipeline developed for the March 2026 Semiconductor Solutions Challenge (Intel & ASU). The project addresses semiconductor defect classification under limited training data and strong class imbalance.
+This repository contains a two-stage machine learning pipeline developed for the March 2026 Semiconductor Solutions Challenge. The project addresses semiconductor defect classification under limited training data and strong class imbalance.
 
 ## Overview
 
