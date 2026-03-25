@@ -1,0 +1,210 @@
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from pathlib import Path
+import numpy as np
+from PIL import Image
+
+import torch
+import timm
+from torchvision import transforms
+from torchvision.transforms import functional as F
+
+# ======================
+# Config
+# ======================
+
+DATA_ROOT = Path("/home/xluan3/simi_challenge/Data")
+OUT_ROOT  = Path("/home/xluan3/simi_challenge/patch_tokens_dinov2")
+
+MODEL_NAME = "vit_small_patch14_dinov2.lvd142m"
+IMG_SIZE   = 518
+BATCH_SIZE = 32
+NUM_WORKERS = 4  # adjust if needed
+
+CLASS_NAMES = [
+    "good","defect1","defect2","defect3","defect4",
+    "defect5","defect8","defect9","defect10"
+]
+
+# ======================
+# Device
+# ======================
+
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
+
+print("Using device:", device)
+
+# ======================
+# Resize + Pad
+# ======================
+
+class ResizePadSquare:
+    def __init__(self, size=IMG_SIZE):
+        self.size = size
+
+    def __call__(self, img):
+        img = img.convert("RGB")
+        w, h = img.size
+        scale = self.size / max(w, h)
+        nw, nh = int(round(w * scale)), int(round(h * scale))
+        img = img.resize((nw, nh), Image.BICUBIC)
+
+        pl = (self.size - nw) // 2
+        pt = (self.size - nh) // 2
+        pr = self.size - nw - pl
+        pb = self.size - nh - pt
+
+        return F.pad(img, [pl, pt, pr, pb], fill=0)
+
+tfm = transforms.Compose([
+    ResizePadSquare(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=(0.485,0.456,0.406),
+        std=(0.229,0.224,0.225)
+    )
+])
+
+# ======================
+# Load backbone
+# ======================
+
+model = timm.create_model(MODEL_NAME, pretrained=True)
+model.reset_classifier(0)
+model.eval()
+model.to(device)
+
+print("Model loaded.")
+
+# ======================
+# Feature extraction
+# ======================
+
+@torch.no_grad()
+def extract_patch_tokens(x: torch.Tensor):
+    """
+    Return patch tokens as (B, N, D) (NO CLS token).
+    Works for timm DINOv2 ViT variants with different forward_features outputs.
+    """
+    # Try the most explicit/robust path first: forward_intermediates (if available)
+    if hasattr(model, "forward_intermediates"):
+        # usually returns (final, intermediates) or similar; keep flexible
+        out = model.forward_intermediates(x, return_prefix_tokens=True)
+        # timm versions differ:
+        # - may return (y, intermediates)
+        # - may return dict with 'intermediates'
+        if isinstance(out, tuple) and len(out) >= 2:
+            inter = out[1]
+        elif isinstance(out, dict) and "intermediates" in out:
+            inter = out["intermediates"]
+        else:
+            inter = out
+
+        # inter can be list of tensors, take the last layer
+        if isinstance(inter, (list, tuple)) and len(inter) > 0:
+            t = inter[-1]
+        else:
+            t = inter
+
+        # t expected shape (B, 1+N, D) if return_prefix_tokens=True
+        if isinstance(t, torch.Tensor) and t.ndim == 3 and t.shape[1] >= 2:
+            return t[:, 1:, :]  # drop CLS, keep patches
+
+    # Fallback: forward_features
+    feats = model.forward_features(x)
+
+    # Case 1: forward_features returns dict
+    if isinstance(feats, dict):
+        # common keys in timm
+        for k in ["x", "tokens", "last_hidden_state", "feat"]:
+            if k in feats and isinstance(feats[k], torch.Tensor) and feats[k].ndim == 3:
+                t = feats[k]
+                return t[:, 1:, :] if t.shape[1] >= 2 else t
+        # sometimes it stores pre-logits etc.
+        for v in feats.values():
+            if isinstance(v, torch.Tensor) and v.ndim == 3:
+                t = v
+                return t[:, 1:, :] if t.shape[1] >= 2 else t
+
+    # Case 2: forward_features returns tensor directly
+    if isinstance(feats, torch.Tensor):
+        # If it's (B, D) that's CLS pooled, not tokens.
+        if feats.ndim == 3:
+            t = feats
+            return t[:, 1:, :] if t.shape[1] >= 2 else t
+        raise RuntimeError(f"forward_features returned tensor with shape {tuple(feats.shape)}; "
+                           f"this looks pooled, not token sequence.")
+
+    # Case 3: forward_features returns tuple/list
+    if isinstance(feats, (tuple, list)):
+        # look for any 3D tensor inside
+        for item in feats:
+            if isinstance(item, torch.Tensor) and item.ndim == 3:
+                t = item
+                return t[:, 1:, :] if t.shape[1] >= 2 else t
+
+    raise RuntimeError(f"Unexpected forward_features output type: {type(feats)}")
+
+def list_images(folder):
+    exts = {".png",".jpg",".jpeg",".bmp",".tif",".tiff"}
+    return sorted([p for p in folder.iterdir()
+                   if p.suffix.lower() in exts])
+
+
+def process_class(cls_name):
+    in_dir = DATA_ROOT / cls_name
+    out_dir = OUT_ROOT / cls_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = list_images(in_dir)
+    print(f"[{cls_name}] {len(paths)} images")
+
+    batch_imgs = []
+    batch_paths = []
+
+    for idx, p in enumerate(paths):
+        try:
+            img = Image.open(p)
+            img = tfm(img)
+        except:
+            print("Skipping bad image:", p)
+            continue
+
+        batch_imgs.append(img)
+        batch_paths.append(p)
+
+        if len(batch_imgs) == BATCH_SIZE or idx == len(paths)-1:
+
+            x = torch.stack(batch_imgs).to(device)
+            tokens = extract_patch_tokens(x)  # (B,1369,384)
+            tokens = tokens.cpu().numpy()
+
+            for i, path in enumerate(batch_paths):
+                out_path = out_dir / (path.stem + ".npz")
+                np.savez_compressed(
+                    out_path,
+                    patch_tokens=tokens[i],
+                    grid=(37,37)
+                )
+
+            batch_imgs = []
+            batch_paths = []
+
+    print(f"[{cls_name}] Done.")
+
+
+# ======================
+# Main
+# ======================
+
+if __name__ == "__main__":
+
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    for cls in CLASS_NAMES:
+        process_class(cls)
